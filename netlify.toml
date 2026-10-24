@@ -1,0 +1,21 @@
+[build]
+  publish = "www"
+  command = ""
+
+# Il service worker non deve essere messo in cache dal CDN,
+# altrimenti gli aggiornamenti dell'app non arrivano mai.
+[[headers]]
+  for = "/sw.js"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+[[headers]]
+  for = "/manifest.webmanifest"
+  [headers.values]
+    Content-Type = "application/manifest+json"
+    Cache-Control = "no-cache"
+
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-cache"

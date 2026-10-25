@@ -145,6 +145,8 @@
   .pic img{width:84px;height:84px;object-fit:cover;border-radius:9px;display:block;cursor:pointer}
   .pic button{position:absolute;top:-6px;right:-6px;width:26px;height:26px;border-radius:50%;border:none;
     background:var(--danger);color:#fff;font-weight:800;cursor:pointer;line-height:1}
+  .ocr{margin-top:8px}
+  .ocr .note{margin:0}
   .switch{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:6px 0 12px}
   .switch input{width:auto;transform:scale(1.4);accent-color:var(--hv)}
   .pickl .item{margin-bottom:6px}
@@ -266,7 +268,7 @@ $('vx').addEventListener('click',()=>history.back());
 let pickCb=null;
 function pickPhotos(fromCam,cb){pickCb=cb;const i=fromCam?$('fCam'):$('fGal');i.value='';i.click();}
 async function onPicked(e){const files=[...e.target.files];if(!files.length||!pickCb)return;
-  try{const out=[];for(const f of files)out.push(await compressImage(f,1600,0.72));pickCb(out);}
+  try{const out=[];for(const f of files)out.push(await compressImage(f,1600,0.72));pickCb(out,files);}
   catch(err){toast('Foto non leggibile',true);}}
 $('fCam').addEventListener('change',onPicked);$('fGal').addEventListener('change',onPicked);
 
@@ -487,6 +489,62 @@ function editIntervento(l,it){
   });
 }
 
+/* ================= Lettura scontrino (OCR ML Kit, solo APK) ================= */
+function ocrDisponibile(){return !!(isNative()&&window.Capacitor.Plugins&&window.Capacitor.Plugins.Ocr);}
+const RE_IMP=/(?<![\d.,\/\-:])(\d{1,3}(?:[.\s]\d{3})+|\d{1,6})\s?[.,]\s?(\d{2})(?![\d%]|[.,\/\-:]\d)/g;
+function importiIn(t){const out=[];let m;RE_IMP.lastIndex=0;
+  while((m=RE_IMP.exec(t))){const v=parseFloat(m[1].replace(/[.\s]/g,'')+'.'+m[2]);if(v>0&&v<100000)out.push(v);}return out;}
+/* raggruppa le righe lette per riga orizzontale dello scontrino (etichetta a sinistra, importo a destra) */
+function righeScontrino(res){
+  const ls=(res.lines||[]).filter(x=>x&&x.text);
+  if(!ls.length)return String(res.text||'').split('\n').filter(Boolean);
+  if(ls.some(x=>x.t==null))return ls.map(x=>x.text);
+  const it=ls.map(x=>({text:x.text,l:x.l,cy:(x.t+x.b)/2,h:Math.max(1,x.b-x.t)})).sort((a,b)=>a.cy-b.cy);
+  const rows=[];
+  for(const x of it){const r=rows[rows.length-1];
+    if(r&&Math.abs(x.cy-r.cy)<Math.max(x.h,r.h)*0.55){r.items.push(x);r.cy=(r.cy*(r.items.length-1)+x.cy)/r.items.length;}
+    else rows.push({cy:x.cy,h:x.h,items:[x]});}
+  return rows.map(r=>r.items.sort((a,b)=>a.l-b.l).map(x=>x.text).join(' '));
+}
+function analizzaScontrino(res){
+  const rows=righeScontrino(res);const U=rows.map(r=>r.toUpperCase());
+  const ESCLUDI=/RESTO|CONTANT|SUBTOT|IVA|IMPONIBILE|SCONT|PEZZI|ARTICOLI|N\.\s?PZ|%/;
+  let totale=null;
+  // 1) righe con "TOTALE …" (le più affidabili), poi "PAGATO / DA PAGARE / IMPORTO"
+  const livelli=[/TOTALE\s*(COMPLESSIVO|EURO|EUR|€|DA PAGARE|DOCUMENTO|GENERALE)/,/\bTOTALE\b|\bTOT\b\.?/,/IMPORTO PAGATO|DA PAGARE|PAGAMENTO ELETTRONICO|PAGATO|\bIMPORTO\b/];
+  for(const re of livelli){const c=[];
+    U.forEach((u,i)=>{if(re.test(u)&&!/SUBTOT|TOTALE IVA|IVA\s|IMPONIBILE|SCONT|PEZZI|ARTICOLI/.test(u)){
+      let v=importiIn(rows[i]);if(!v.length&&rows[i+1]&&!ESCLUDI.test(U[i+1]))v=importiIn(rows[i+1]);c.push(...v);}});
+    if(c.length){totale=Math.max(...c);break;}}
+  // 2) contanti dati meno resto
+  if(totale==null){const ic=U.findIndex(u=>/CONTANT/.test(u)),ir=U.findIndex(u=>/RESTO/.test(u));
+    if(ic>=0&&ir>=0){const c=importiIn(rows[ic]),r=importiIn(rows[ir]);if(c.length&&r.length&&c[0]>r[0])totale=Math.round((c[0]-r[0])*100)/100;}}
+  // 3) altrimenti l'importo più alto, escluse righe di resto/contanti/IVA
+  if(totale==null){const c=[];U.forEach((u,i)=>{if(!ESCLUDI.test(u))c.push(...importiIn(rows[i]));});if(c.length)totale=Math.max(...c);}
+  // data
+  let data=null;const tutto=rows.join('\n');const reD=/(?<!\d)(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4}|\d{2})(?!\d)/g;let m;
+  const oggi=todayISO();
+  while((m=reD.exec(tutto))){const d=+m[1],mo=+m[2];let y=+m[3];if(y<100)y+=2000;
+    if(d<1||d>31||mo<1||mo>12)continue;const iso=y+'-'+String(mo).padStart(2,'0')+'-'+String(d).padStart(2,'0');
+    if(iso>oggi||iso<(+oggi.slice(0,4)-1)+oggi.slice(4))continue;data=iso;break;}
+  // nome del negozio: prima riga "di testo" in alto
+  let negozio='';
+  for(const r of rows.slice(0,6)){const t=r.trim();
+    if((t.match(/[A-Za-zÀ-ú]/g)||[]).length<3)continue;
+    if(/DOCUMENTO|COMMERCIALE|SCONTRINO|FISCALE|VENDITA|PRESTAZIONE|BENVENUT|P\.?\s?IVA|PARTITA|TEL|VIA |C\.F|WWW|@/i.test(t))continue;
+    if(importiIn(t).length)continue;
+    negozio=t.replace(/\s+/g,' ').slice(0,40);
+    if(negozio===negozio.toUpperCase())negozio=negozio.toLowerCase().replace(/(^|[\s'\-.])(\S)/g,(a,b,c)=>b+c.toUpperCase());
+    break;}
+  return {totale,data,negozio,righe:rows};
+}
+async function leggiScontrino(src){
+  // src: File (foto appena scattata) o dataURL
+  const d=(src instanceof Blob)?await compressImage(src,2400,0.85):src;
+  const res=await window.Capacitor.Plugins.Ocr.recognize({base64:d});
+  return analizzaScontrino(res);
+}
+
 /* --- spesa / scontrino --- */
 function editMateriale(l,m){
   const nuovo=!m;m=m||{id:uid(),data:todayISO(),descr:'',importo:'',addebita:true,foto:[]};
@@ -502,15 +560,36 @@ function editMateriale(l,m){
   openSheet('<h3>'+(nuovo?'Nuova spesa':'Spesa')+'</h3>'+
     '<div class="row" style="margin-bottom:6px"><button class="btn btn-ghost" id="cam">📷 Scatta scontrino</button><button class="btn btn-ghost" id="gal">🖼 Galleria</button></div>'+
     '<div class="pics" id="pics"></div>'+
+    (ocrDisponibile()?'<div class="ocr" id="ocr"></div>':'')+
     '<div class="field mt"><label>Descrizione</label><input name="descr" placeholder="es. Brico – cavo e scatole" value="'+esc(m.descr)+'"></div>'+
     '<div class="two"><div class="field"><label>Importo €</label><input name="importo" inputmode="decimal" placeholder="0,00" value="'+esc(fmtN(num(m.importo)))+'"></div>'+
     '<div class="field"><label>Data</label><input type="date" name="data" value="'+esc(m.data)+'"></div></div>'+
     '<label class="switch"><span>Addebita al cliente<br><span class="note" style="margin:0">Se spento è una spesa a tuo carico: conta nel guadagno netto ma non nel totale del cliente.</span></span><input type="checkbox" name="add"'+(m.addebita!==false?' checked':'')+'></label>'+
     '<div class="row"><button class="btn btn-primary" id="ok">Salva</button></div>'+
     (nuovo?'':'<button class="btn btn-danger mt" id="del">Elimina spesa</button>'),root=>{
-    draw(root);
-    $('cam').addEventListener('click',()=>pickPhotos(true,ds=>{nuove.push(...ds);draw(root);}));
-    $('gal').addEventListener('click',()=>pickPhotos(false,ds=>{nuove.push(...ds);draw(root);}));
+    const ocrBox=root.querySelector('#ocr');
+    const fotoPerOcr=()=>nuove[0]||((m.foto||[]).filter(f=>!rimosse.includes(f))[0]&&fotoCache[(m.foto||[]).filter(f=>!rimosse.includes(f))[0]]);
+    const ocrIdle=()=>{if(!ocrBox)return;ocrBox.innerHTML=fotoPerOcr()?'<button class="btn btn-ghost btn-sm" id="ocrGo">🔍 Leggi scontrino</button>':'';
+      const b=root.querySelector('#ocrGo');if(b)b.addEventListener('click',async()=>{const src=fotoPerOcr();if(src)await ocrEsegui(src,true);});};
+    const evidenzia=el=>{el.style.borderColor='var(--hv)';el.addEventListener('input',()=>el.style.borderColor='',{once:true});};
+    const ocrEsegui=async(src,sovrascrivi)=>{
+      if(!ocrBox)return;ocrBox.innerHTML='<div class="note">🔍 Leggo lo scontrino…</div>';
+      try{const r=await leggiScontrino(src);if(!root.isConnected)return;
+        const fI=root.querySelector('[name=importo]'),fD=root.querySelector('[name=descr]'),fT=root.querySelector('[name=data]');
+        const vuoto=!num(fI.value);const trov=[];
+        if(r.totale!=null){trov.push('totale <b>'+fmtE(r.totale)+'</b>');if(sovrascrivi||vuoto){fI.value=r.totale.toFixed(2).replace('.',',');evidenzia(fI);}}
+        if(r.negozio){trov.push(esc(r.negozio));if(sovrascrivi||!fD.value.trim()){fD.value=r.negozio;evidenzia(fD);}}
+        if(r.data){trov.push(dmy(r.data));if(sovrascrivi||vuoto){fT.value=r.data;evidenzia(fT);}}
+        ocrBox.innerHTML=(trov.length?'<div class="note">Letto: '+trov.join(' · ')+'. <b>Controlla prima di salvare.</b></div>':'<div class="note">Non ho trovato il totale: scrivilo a mano.</div>')+
+          '<button class="btn btn-ghost btn-sm mt" id="ocrGo">🔍 Rileggi</button>';
+        root.querySelector('#ocrGo').addEventListener('click',async()=>{const s2=fotoPerOcr();if(s2)await ocrEsegui(s2,true);});
+      }catch(e){if(root.isConnected)ocrBox.innerHTML='<div class="note" style="color:var(--danger)">Lettura non riuscita: '+esc(e&&e.message||e)+'</div>';}};
+    const drawAll=()=>{draw(root);if(ocrBox&&!ocrBox.querySelector('.note'))ocrIdle();};
+    drawAll();
+    const dopoFoto=(ds,files)=>{const primaNuova=!nuove.length;nuove.push(...ds);drawAll();
+      if(ocrBox&&primaNuova&&files&&files[0])ocrEsegui(files[0],false);};
+    $('cam').addEventListener('click',()=>pickPhotos(true,dopoFoto));
+    $('gal').addEventListener('click',()=>pickPhotos(false,dopoFoto));
     $('ok').addEventListener('click',async()=>{
       const imp=num(val(root,'importo'));
       if(!imp&&!val(root,'descr').trim()&&!nuove.length){toast('Inserisci importo o descrizione',true);return;}
@@ -648,7 +727,7 @@ async function viewAltro(){
     '<div class="field"><label for="eA">Al</label><input type="date" id="eA" value="'+todayISO()+'"></div></div>'+
     '<button class="btn btn-ghost" id="bCsv">Esporta CSV</button>'+
     '<div class="note">Una riga per ogni intervento, spesa e pagamento nel periodo. Si apre con Excel o Fogli Google.</div></div>'+
-    '<div class="note" style="text-align:center">Lavori · v1.0</div>';
+    '<div class="note" style="text-align:center">Lavori · v1.1</div>';
   $('sTar').addEventListener('change',async e=>{S.set.tariffa=num(e.target.value);await saveSet();toast('Tariffa salvata');});
   $('sInt').addEventListener('change',async e=>{S.set.intestazione=e.target.value;await saveSet();});
   $('sTema').querySelectorAll('[data-t]').forEach(b=>b.addEventListener('click',async()=>{S.set.tema=b.dataset.t;applyTema();await saveSet();viewAltro();}));

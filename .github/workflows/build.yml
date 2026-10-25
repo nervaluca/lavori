@@ -32,6 +32,21 @@ jobs:
       - name: Generate app icon and splash
         run: npx capacitor-assets generate --android
 
+      # ── Plugin OCR (ML Kit) ──
+      - name: Copia plugin OCR e MainActivity
+        run: |
+          SRC="android/app/src/main/java/it/iw1fzr/lavori"
+          mkdir -p "$SRC/plugins"
+          cp android-plugin/OcrPlugin.java "$SRC/plugins/"
+          cp android-plugin/MainActivity.java "$SRC/MainActivity.java"
+
+      - name: Aggiungi ML Kit e minSdk 23
+        run: |
+          printf "\ndependencies {\n    implementation 'com.google.mlkit:text-recognition:16.0.1'\n}\n" >> android/app/build.gradle
+          sed -i -E 's/minSdkVersion = [0-9]+/minSdkVersion = 23/' android/variables.gradle
+          grep -n "minSdkVersion" android/variables.gradle
+          tail -4 android/app/build.gradle
+
       - name: Sync web assets
         run: npx cap sync android
 
